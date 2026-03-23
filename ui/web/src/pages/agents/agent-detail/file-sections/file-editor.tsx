@@ -1,8 +1,9 @@
-import { type ReactNode, useRef, useCallback } from "react";
+import { type ReactNode, useRef, useCallback, useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
-import { Save, Loader2 } from "lucide-react";
+import { Save, Loader2, Eye, Pencil } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { MarkdownRenderer } from "@/components/shared/markdown-renderer";
 import { FILE_DESCRIPTIONS } from "./file-utils";
 import { ContactInsertSearch } from "./contact-insert-search";
 
@@ -34,6 +35,13 @@ export function FileEditor({
 }: FileEditorProps) {
   const { t } = useTranslation("agents");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const isMdFile = fileName?.endsWith(".md") ?? false;
+  const [previewMode, setPreviewMode] = useState(isMdFile);
+
+  // Reset preview mode when file changes: default on for .md, off for others
+  useEffect(() => {
+    setPreviewMode(isMdFile);
+  }, [fileName]);
 
   const handleInsertText = useCallback(
     (text: string) => {
@@ -76,7 +84,7 @@ export function FileEditor({
   }
 
   return (
-    <div className="flex flex-1 flex-col">
+    <div className="flex flex-1 min-w-0 flex-col">
       <div className="mb-2 flex items-center gap-3">
         <div className="min-w-0 flex-1">
           <span className="text-sm font-medium">{fileName}</span>
@@ -88,7 +96,18 @@ export function FileEditor({
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {headerActions}
-          {canEdit && (
+          {isMdFile && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => setPreviewMode((v) => !v)}
+              title={previewMode ? t("files.editMode") : t("files.previewMode")}
+            >
+              {previewMode ? <Pencil className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              {previewMode ? t("files.edit") : t("files.preview")}
+            </Button>
+          )}
+          {canEdit && !previewMode && (
             <Button size="sm" onClick={onSave} disabled={!dirty || saving}>
               {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Save className="h-3.5 w-3.5" />}
               {saving ? t("files.saving") : t("files.save")}
@@ -104,6 +123,10 @@ export function FileEditor({
       {loading && !content ? (
         <div className="flex flex-1 items-center justify-center text-sm text-muted-foreground">
           {t("files.loading")}
+        </div>
+      ) : previewMode ? (
+        <div className="flex-1 min-w-0 overflow-y-auto rounded-md border bg-background px-6 py-4">
+          <MarkdownRenderer content={content} />
         </div>
       ) : (
         <Textarea

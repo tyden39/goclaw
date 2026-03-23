@@ -189,7 +189,11 @@
     "emptyFile": "empty",
     "estTokens": "Est {{tokens}} tokens",
     "insertContact": "Search contact to insert...",
-    "contentPlaceholder": "File content..."
+    "contentPlaceholder": "File content...",
+    "preview": "Preview",
+    "edit": "Edit",
+    "previewMode": "Switch to preview mode",
+    "editMode": "Switch to edit mode"
   },
   "fileEditor": {
     "editWithAi": "Edit with AI",
