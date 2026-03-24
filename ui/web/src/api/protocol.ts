@@ -151,6 +151,7 @@ export const Methods = {
   TEAMS_WORKSPACE_LIST: "teams.workspace.list",
   TEAMS_WORKSPACE_READ: "teams.workspace.read",
   TEAMS_WORKSPACE_DELETE: "teams.workspace.delete",
+  TEAMS_EVENTS_LIST: "teams.events.list",
 
   // Heartbeat
   HEARTBEAT_GET: "heartbeat.get",
@@ -166,6 +167,16 @@ export const Methods = {
   CONFIG_PERMISSIONS_LIST: "config.permissions.list",
   CONFIG_PERMISSIONS_GRANT: "config.permissions.grant",
   CONFIG_PERMISSIONS_REVOKE: "config.permissions.revoke",
+
+  // Tenants (multi-tenant)
+  TENANTS_MINE: "tenants.mine",
+  TENANTS_LIST: "tenants.list",
+  TENANTS_GET: "tenants.get",
+  TENANTS_CREATE: "tenants.create",
+  TENANTS_UPDATE: "tenants.update",
+  TENANTS_USERS_LIST: "tenants.users.list",
+  TENANTS_USERS_ADD: "tenants.users.add",
+  TENANTS_USERS_REMOVE: "tenants.users.remove",
 
   // Phase 3+ - NICE TO HAVE
   LOGS_TAIL: "logs.tail",
@@ -205,6 +216,9 @@ export const Events = {
   TEAM_TASK_ASSIGNED: "team.task.assigned",
   TEAM_TASK_DISPATCHED: "team.task.dispatched",
   TEAM_TASK_DELETED: "team.task.deleted",
+
+  // Team leader processing (bridges gap between last task.completed and announce run.started)
+  TEAM_LEADER_PROCESSING: "team.leader.processing",
 
   // Team messages
   TEAM_MESSAGE_SENT: "team.message.sent",

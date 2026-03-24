@@ -38,13 +38,21 @@ func processNormalMessage(
 	postTurn tools.PostTurnProcessor,
 	msgBus *bus.MessageBus,
 ) {
+	// Inject tenant from channel instance into context so all store operations
+	// (agent lookup, session creation, etc.) are tenant-scoped.
+	if msg.TenantID != uuid.Nil {
+		ctx = store.WithTenantID(ctx, msg.TenantID)
+	} else {
+		ctx = store.WithTenantID(ctx, store.MasterTenantID)
+	}
+
 	// Determine target agent via bindings or explicit AgentID
 	agentID := msg.AgentID
 	if agentID == "" {
 		agentID = resolveAgentRoute(cfg, msg.Channel, msg.ChatID, msg.PeerKind)
 	}
 
-	agentLoop, err := agents.Get(agentID)
+	agentLoop, err := agents.Get(ctx, agentID)
 	if err != nil {
 		slog.Warn("inbound: agent not found", "agent", agentID, "channel", msg.Channel)
 		return
@@ -96,7 +104,7 @@ func processNormalMessage(
 	// Persist friendly names from channel metadata into session + user profile.
 	sessionMeta := extractSessionMetadata(msg, peerKind)
 	if len(sessionMeta) > 0 {
-		sessStore.SetSessionMetadata(sessionKey, sessionMeta)
+		sessStore.SetSessionMetadata(ctx, sessionKey, sessionMeta)
 		if agentStore != nil {
 			if agentUUID, err := uuid.Parse(agentID); err == nil && agentUUID != uuid.Nil {
 				_ = agentStore.UpdateUserProfileMetadata(ctx, agentUUID, userID, sessionMeta)
@@ -298,9 +306,19 @@ func processNormalMessage(
 		}
 	}
 
+	// Inject tenant context from channel instance so all store queries are tenant-scoped.
+	if msg.TenantID != uuid.Nil {
+		ctx = store.WithTenantID(ctx, msg.TenantID)
+	}
+
 	// Inject post-turn dispatch tracker so team task creates are deferred.
 	ptd := tools.NewPendingTeamDispatch()
 	schedCtx := tools.WithPendingTeamDispatch(ctx, ptd)
+
+	// Propagate run_kind from metadata (e.g. "notification" for team task status relays).
+	if rk := msg.Metadata["run_kind"]; rk != "" {
+		schedCtx = tools.WithRunKind(schedCtx, rk)
+	}
 
 	// Schedule through main lane (per-session concurrency controlled by maxConcurrent)
 	outCh := sched.ScheduleWithOpts(schedCtx, "main", agent.RunRequest{

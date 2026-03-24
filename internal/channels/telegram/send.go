@@ -161,6 +161,24 @@ func (c *Channel) Send(ctx context.Context, msg bus.OutboundMessage) error {
 		}
 	}
 
+	// Captured draft cleanup: if this message follows a DM stream that used the
+	// draft transport, we must clear the stale draft as soon as this bubble is sent.
+	if pID, ok := c.pendingDraftID.LoadAndDelete(localKey); ok {
+		draftID := pID.(int)
+		go func() {
+			params := &telego.SendMessageDraftParams{
+				ChatID:          chatID,
+				DraftID:         draftID,
+				Text:            "",
+				MessageThreadID: resolveThreadIDForSend(threadID),
+			}
+			// Best-effort with Background ctx — caller ctx may already be cancelled.
+			if err := c.bot.SendMessageDraft(context.Background(), params); err != nil {
+				slog.Debug("telegram: draft clear failed (cosmetic)", "chat_id", chatID, "draft_id", draftID, "error", err)
+			}
+		}()
+	}
+
 	// Placeholder update (e.g. LLM retry notification): edit the placeholder
 	// but keep it alive for the final response. Don't stop typing or cleanup.
 	if msg.Metadata["placeholder_update"] == "true" {
@@ -280,6 +298,20 @@ func (c *Channel) sendMediaMessage(ctx context.Context, chatID int64, msg bus.Ou
 				followUpText = caption
 				caption = ""
 			}
+		}
+
+		// Honor MediaMaxBytes for outbound sends.
+		// Prevents attempting to upload huge files that would fail via Telegram Bot API or local proxy.
+		maxBytes := c.config.MediaMaxBytes
+		if maxBytes == 0 {
+			if c.config.APIServer != "" {
+				maxBytes = localAPIDefaultMaxBytes
+			} else {
+				maxBytes = defaultMediaMaxBytes
+			}
+		}
+		if info, err := os.Stat(media.URL); err == nil && info.Size() > maxBytes {
+			return fmt.Errorf("outbound media too large: %d bytes (limit %d)", info.Size(), maxBytes)
 		}
 
 		// Send based on content type.

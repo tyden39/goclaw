@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	"github.com/google/uuid"
@@ -28,6 +29,7 @@ const (
 	ctxWorkspace   toolContextKey = "tool_workspace"
 	ctxAgentKey    toolContextKey = "tool_agent_key"
 	ctxSessionKey  toolContextKey = "tool_session_key" // origin session key for announce routing
+	ctxRunKind     toolContextKey = "tool_run_kind"    // "notification", "announce", "delegation"
 )
 
 // Well-known channel names used for routing and access control.
@@ -141,6 +143,21 @@ func ToolSessionKeyFromCtx(ctx context.Context) string {
 	return v
 }
 
+// WithRunKind injects the run classification (e.g. "notification") into context.
+func WithRunKind(ctx context.Context, kind string) context.Context {
+	return context.WithValue(ctx, ctxRunKind, kind)
+}
+
+// RunKindFromCtx returns the run kind from context, or empty string.
+func RunKindFromCtx(ctx context.Context) string {
+	v, _ := ctx.Value(ctxRunKind).(string)
+	return v
+}
+
+// RunKindNotification is the run kind for team task notification runs.
+// Leader agents in this mode can only relay status — mutations are blocked.
+const RunKindNotification = "notification"
+
 // --- Builtin tool settings (global DB overrides) ---
 
 const ctxBuiltinToolSettings toolContextKey = "tool_builtin_settings"
@@ -173,10 +190,9 @@ func RestrictFromCtx(ctx context.Context) (bool, bool) {
 }
 
 func effectiveRestrict(ctx context.Context, toolDefault bool) bool {
-	if v, ok := RestrictFromCtx(ctx); ok {
-		return v
-	}
-	return toolDefault
+	// Multi-tenant security: always restrict agents to their workspace.
+	// Agents must not access files outside their tenant-scoped workspace.
+	return true
 }
 
 // --- Parent agent model (for subagent inheritance) ---
@@ -381,6 +397,30 @@ func WithPendingTeamDispatch(ctx context.Context, ptd *PendingTeamDispatch) cont
 func PendingTeamDispatchFromCtx(ctx context.Context) *PendingTeamDispatch {
 	v, _ := ctx.Value(ctxPendingDispatch).(*PendingTeamDispatch)
 	return v
+}
+
+// InjectTeamDispatch creates a fresh PendingTeamDispatch context for a direct
+// loop.Run() call (WS chat.send, HTTP API, etc.) and returns a drain function
+// that must be called after the run completes. The drain function dispatches
+// any pending team tasks via the provided PostTurnProcessor. It is safe to
+// call even if no tasks were created. Pass nil postTurn if not available.
+func InjectTeamDispatch(ctx context.Context, postTurn PostTurnProcessor) (context.Context, func()) {
+	ptd := NewPendingTeamDispatch()
+	ctx = WithPendingTeamDispatch(ctx, ptd)
+	// Detach from caller's cancel/deadline but keep values (tenant_id, user_id, etc.)
+	// so post-turn dispatch isn't aborted when the HTTP request or WS handler returns.
+	detached := context.WithoutCancel(ctx)
+	drain := func() {
+		ptd.ReleaseTeamLock()
+		if postTurn != nil {
+			for teamID, taskIDs := range ptd.Drain() {
+				if err := postTurn.ProcessPendingTasks(detached, teamID, taskIDs); err != nil {
+					slog.Warn("post_turn: dispatch failed", "team_id", teamID, "error", err)
+				}
+			}
+		}
+	}
+	return ctx, drain
 }
 
 // --- Run media file paths (for team workspace auto-collect) ---

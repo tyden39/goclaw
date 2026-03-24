@@ -10,25 +10,33 @@ import (
 
 	"github.com/nextlevelbuilder/goclaw/internal/agent"
 	"github.com/nextlevelbuilder/goclaw/internal/bus"
+	httpapi "github.com/nextlevelbuilder/goclaw/internal/http"
 	"github.com/nextlevelbuilder/goclaw/internal/channels/media"
 	"github.com/nextlevelbuilder/goclaw/internal/gateway"
 	"github.com/nextlevelbuilder/goclaw/internal/i18n"
 	"github.com/nextlevelbuilder/goclaw/internal/providers"
 	"github.com/nextlevelbuilder/goclaw/internal/sessions"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
+	"github.com/nextlevelbuilder/goclaw/internal/tools"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
 )
 
 // ChatMethods handles chat.send, chat.history, chat.abort, chat.inject.
 type ChatMethods struct {
-	agents      *agent.Router
-	sessions    store.SessionStore
-	rateLimiter *gateway.RateLimiter
-	eventBus    bus.EventPublisher
+	agents         *agent.Router
+	sessions       store.SessionStore
+	rateLimiter    *gateway.RateLimiter
+	eventBus       bus.EventPublisher
+	postTurn tools.PostTurnProcessor
 }
 
 func NewChatMethods(agents *agent.Router, sess store.SessionStore, rl *gateway.RateLimiter, eventBus bus.EventPublisher) *ChatMethods {
 	return &ChatMethods{agents: agents, sessions: sess, rateLimiter: rl, eventBus: eventBus}
+}
+
+// SetPostTurnProcessor sets the post-turn processor for team task dispatch.
+func (m *ChatMethods) SetPostTurnProcessor(pt tools.PostTurnProcessor) {
+	m.postTurn = pt
 }
 
 // Register adds chat methods to the router.
@@ -107,7 +115,7 @@ func (m *ChatMethods) handleSend(ctx context.Context, client *gateway.Client, re
 		}
 	}
 
-	loop, err := m.agents.Get(params.AgentID)
+	loop, err := m.agents.Get(ctx, params.AgentID)
 	if err != nil {
 		client.SendResponse(protocol.NewErrorResponse(req.ID, protocol.ErrNotFound, err.Error()))
 		return
@@ -150,6 +158,10 @@ func (m *ChatMethods) handleSend(ctx context.Context, client *gateway.Client, re
 		// Fallback: injection failed (channel full), proceed with new run
 	}
 
+	// Inject team dispatch tracker: gates team_tasks create (must search/list first)
+	// and defers task dispatch to post-turn.
+	runCtxBase, drainTeamDispatch := tools.InjectTeamDispatch(runCtxBase, m.postTurn)
+
 	// Create cancellable context for abort support (matching TS AbortController pattern).
 	runCtx, cancel := context.WithCancel(runCtxBase)
 	injectCh := m.agents.RegisterRun(runID, sessionKey, params.AgentID, cancel)
@@ -158,6 +170,7 @@ func (m *ChatMethods) handleSend(ctx context.Context, client *gateway.Client, re
 	go func() {
 		defer m.agents.UnregisterRun(runID)
 		defer cancel()
+		defer drainTeamDispatch() // dispatch pending team tasks + release lock (even on panic)
 
 		// Parse media items (supports both legacy string paths and new {path,filename} objects).
 		items := params.parseMedia()
@@ -210,24 +223,25 @@ func (m *ChatMethods) handleSend(ctx context.Context, client *gateway.Client, re
 		}
 
 		// Auto-generate conversation title on first message (label empty = never titled).
-		if label := m.sessions.GetLabel(sessionKey); label == "" {
+		if label := m.sessions.GetLabel(ctx, sessionKey); label == "" {
 			agentProvider := loop.Provider()
 			agentModel := loop.Model()
 			userMsg := params.Message
+			// Use runCtxBase (WithoutCancel + tenant-aware) so title save uses correct tenant.
+			titleCtx := runCtxBase
 			go func() {
-				title := agent.GenerateTitle(context.Background(), agentProvider, agentModel, userMsg)
+				title := agent.GenerateTitle(titleCtx, agentProvider, agentModel, userMsg)
 				if title == "" {
 					return
 				}
-				m.sessions.SetLabel(sessionKey, title)
-				if err := m.sessions.Save(sessionKey); err != nil {
+				m.sessions.SetLabel(titleCtx, sessionKey, title)
+				if err := m.sessions.Save(titleCtx, sessionKey); err != nil {
 					slog.Warn("failed to save session title", "sessionKey", sessionKey, "error", err)
 					return
 				}
-				m.eventBus.Broadcast(bus.Event{
-					Name:    protocol.EventSessionUpdated,
-					Payload: map[string]string{"sessionKey": sessionKey, "label": title},
-				})
+				bus.BroadcastForTenant(m.eventBus, protocol.EventSessionUpdated,
+					client.TenantID(),
+					map[string]string{"sessionKey": sessionKey, "label": title, "userId": userID})
 			}()
 		}
 
@@ -265,7 +279,12 @@ func (m *ChatMethods) handleHistory(ctx context.Context, client *gateway.Client,
 		sessionKey = sessions.BuildWSSessionKey(params.AgentID, uuid.NewString())
 	}
 
-	history := m.sessions.GetHistory(sessionKey)
+	history := m.sessions.GetHistory(ctx, sessionKey)
+
+	// Sign file URLs before delivery — sessions store clean paths.
+	for i := range history {
+		history[i].Content = httpapi.SignFileURLs(history[i].Content, httpapi.FileSigningKey())
+	}
 
 	client.SendResponse(protocol.NewOKResponse(req.ID, map[string]any{
 		"messages": history,
@@ -308,7 +327,7 @@ func (m *ChatMethods) handleInject(ctx context.Context, client *gateway.Client, 
 
 	// Create an assistant message with gateway-injected metadata
 	messageID := uuid.NewString()
-	m.sessions.AddMessage(params.SessionKey, providers.Message{
+	m.sessions.AddMessage(ctx, params.SessionKey, providers.Message{
 		Role:    "assistant",
 		Content: text,
 	})

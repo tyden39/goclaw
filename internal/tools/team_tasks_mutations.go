@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/nextlevelbuilder/goclaw/internal/config"
 	"github.com/nextlevelbuilder/goclaw/internal/store"
 	"github.com/nextlevelbuilder/goclaw/internal/tracing"
 	"github.com/nextlevelbuilder/goclaw/pkg/protocol"
@@ -98,7 +100,7 @@ func (t *TeamTasksTool) executeCreate(ctx context.Context, args map[string]any) 
 	if assigneeKey == "" {
 		return ErrorResult("assignee is required — specify which team member should handle this task")
 	}
-	assigneeID, err := t.manager.resolveAgentByKey(assigneeKey)
+	assigneeID, err := t.manager.resolveAgentByKey(ctx, assigneeKey)
 	if err != nil {
 		return ErrorResult(fmt.Sprintf("assignee %q not found: %v", assigneeKey, err))
 	}
@@ -116,6 +118,12 @@ func (t *TeamTasksTool) executeCreate(ctx context.Context, args map[string]any) 
 	}
 	if !isMember {
 		return ErrorResult(fmt.Sprintf("agent %q is not a member of this team", assigneeKey))
+	}
+	// Prevent lead from self-assigning — causes dual-session execution + loop.
+	// buildCreateHint already hides the lead from the member list hint,
+	// but weaker models may still attempt self-assignment.
+	if assigneeID == team.LeadAgentID {
+		return ErrorResult("team lead cannot assign tasks to itself — delegate to a team member instead. You are the team lead; handle this work directly or assign to one of your members.")
 	}
 
 	requireApproval, _ := args["require_approval"].(bool)
@@ -140,10 +148,11 @@ func (t *TeamTasksTool) executeCreate(ctx context.Context, args map[string]any) 
 		wsChat = ""
 	}
 
-	// Compute the team workspace directory so member agents write files to the
-	// shared team folder instead of their own personal workspace.
+	// Compute the team workspace directory (tenant-scoped) so member agents
+	// write files to the shared team folder instead of their own personal workspace.
 	taskMeta := make(map[string]any)
-	if teamWsDir, err := WorkspaceDir(t.manager.dataDir, team.ID, wsChat); err == nil {
+	tenantBase := config.TenantWorkspace(t.manager.dataDir, store.TenantIDFromContext(ctx), store.TenantSlugFromContext(ctx))
+	if teamWsDir, err := WorkspaceDir(tenantBase, team.ID, wsChat); err == nil {
 		taskMeta["team_workspace"] = teamWsDir
 	}
 	// Auto-collect media files from current run to team workspace.
@@ -231,7 +240,7 @@ func (t *TeamTasksTool) executeCreate(ctx context.Context, args map[string]any) 
 	}
 
 	agentKey := t.manager.agentKeyFromID(ctx, agentID)
-	t.manager.broadcastTeamEvent(protocol.EventTeamTaskCreated, protocol.TeamTaskEventPayload{
+	t.manager.broadcastTeamEvent(ctx, protocol.EventTeamTaskCreated, protocol.TeamTaskEventPayload{
 		TeamID:    team.ID.String(),
 		TaskID:    task.ID.String(),
 		Subject:   subject,
@@ -253,7 +262,7 @@ func (t *TeamTasksTool) executeCreate(ctx context.Context, args map[string]any) 
 			if err := t.manager.teamStore.AssignTask(ctx, task.ID, assigneeID, team.ID); err != nil {
 				slog.Warn("executeCreate: fallback assign failed", "task_id", task.ID, "error", err)
 			} else {
-				t.manager.broadcastTeamEvent(protocol.EventTeamTaskDispatched, protocol.TeamTaskEventPayload{
+				t.manager.broadcastTeamEvent(ctx, protocol.EventTeamTaskDispatched, protocol.TeamTaskEventPayload{
 					TeamID:        team.ID.String(),
 					TaskID:        task.ID.String(),
 					TaskNumber:    task.TaskNumber,
@@ -266,7 +275,7 @@ func (t *TeamTasksTool) executeCreate(ctx context.Context, args map[string]any) 
 					ActorType:     "system",
 					ActorID:       "fallback_dispatch",
 				})
-				t.manager.dispatchTaskToAgent(ctx, task, team.ID, assigneeID)
+				t.manager.dispatchTaskToAgent(ctx, task, team, assigneeID)
 			}
 		}
 	}
@@ -306,15 +315,21 @@ func (t *TeamTasksTool) executeComment(ctx context.Context, args map[string]any)
 		return ErrorResult("task does not belong to your team")
 	}
 
+	commentType, _ := args["type"].(string)
+	if commentType != "blocker" {
+		commentType = "note"
+	}
+
 	if err := t.manager.teamStore.AddTaskComment(ctx, &store.TeamTaskCommentData{
-		TaskID:  taskID,
-		AgentID: &agentID,
-		Content: text,
+		TaskID:      taskID,
+		AgentID:     &agentID,
+		Content:     text,
+		CommentType: commentType,
 	}); err != nil {
 		return ErrorResult("failed to add comment: " + err.Error())
 	}
 
-	t.manager.broadcastTeamEvent(protocol.EventTeamTaskCommented, protocol.TeamTaskEventPayload{
+	t.manager.broadcastTeamEvent(ctx, protocol.EventTeamTaskCommented, protocol.TeamTaskEventPayload{
 		TeamID:      team.ID.String(),
 		TaskID:      taskID.String(),
 		TaskNumber:  task.TaskNumber,
@@ -328,8 +343,34 @@ func (t *TeamTasksTool) executeComment(ctx context.Context, args map[string]any)
 		ActorID:     t.manager.agentKeyFromID(ctx, agentID),
 	})
 
-	return NewResult(fmt.Sprintf("Comment added to task %s.", taskID))
+	// Record action flag after successful store operation.
+	recordTaskAction(ctx, func(f *TaskActionFlags) {
+		f.Commented = true
+		if commentType == "blocker" {
+			f.Escalated = true
+		}
+	})
+
+	// Blocker escalation: auto-fail task + notify leader.
+	if commentType == "blocker" {
+		return t.handleBlockerComment(ctx, team, task, taskID, agentID, text)
+	}
+
+	isLead := agentID == team.LeadAgentID
+	msg := fmt.Sprintf("Comment added to task #%d \"%s\" (id: %s).", task.TaskNumber, task.Subject, taskID)
+	switch {
+	case isLead && task.Status == store.TeamTaskStatusInProgress:
+		msg += " Note: the assignee is currently working and won't see this comment during execution. To redirect, wait for completion then use retry action with this task_id."
+	case isLead && task.Status == store.TeamTaskStatusCompleted:
+		msg += " Task is completed. Use retry action with this task_id to reopen and re-dispatch with your feedback."
+	case isLead && task.Status == store.TeamTaskStatusFailed:
+		msg += " Task failed. Use retry action with this task_id to re-dispatch with your feedback."
+	case !isLead && task.OwnerAgentID != nil && *task.OwnerAgentID == agentID:
+		msg += " Your comment will be included in the task report sent to the leader. Continue working on the task."
+	}
+	return NewResult(msg)
 }
+
 
 func (t *TeamTasksTool) executeProgress(ctx context.Context, args map[string]any) *Result {
 	team, agentID, err := t.manager.resolveTeam(ctx)
@@ -371,12 +412,14 @@ func (t *TeamTasksTool) executeProgress(ctx context.Context, args map[string]any
 	if err := t.manager.teamStore.UpdateTaskProgress(ctx, taskID, team.ID, percent, step); err != nil {
 		return ErrorResult("failed to update progress: " + err.Error())
 	}
+	// Record action flag after successful store operation.
+	recordTaskAction(ctx, func(f *TaskActionFlags) { f.Progressed = true })
 
 	ownerKey := ""
 	if task.OwnerAgentID != nil {
 		ownerKey = t.manager.agentKeyFromID(ctx, *task.OwnerAgentID)
 	}
-	t.manager.broadcastTeamEvent(protocol.EventTeamTaskProgress, protocol.TeamTaskEventPayload{
+	t.manager.broadcastTeamEvent(ctx, protocol.EventTeamTaskProgress, protocol.TeamTaskEventPayload{
 		TeamID:          team.ID.String(),
 		TaskID:          taskID.String(),
 		TaskNumber:      task.TaskNumber,
@@ -410,6 +453,14 @@ func (t *TeamTasksTool) executeAttach(ctx context.Context, args map[string]any) 
 		return ErrorResult("path is required for attach action")
 	}
 
+	// Resolve to absolute path within team workspace.
+	if !filepath.IsAbs(filePath) {
+		if ws := ToolTeamWorkspaceFromCtx(ctx); ws != "" {
+			filePath = filepath.Join(ws, filePath)
+		}
+	}
+	filePath = filepath.Clean(filePath)
+
 	// Verify task belongs to team.
 	task, err := t.manager.teamStore.GetTask(ctx, taskID)
 	if err != nil {
@@ -430,7 +481,7 @@ func (t *TeamTasksTool) executeAttach(ctx context.Context, args map[string]any) 
 		return ErrorResult("failed to attach file: " + err.Error())
 	}
 
-	return NewResult(fmt.Sprintf("File attached to task %s.", taskID))
+	return NewResult(fmt.Sprintf("File attached to task #%d \"%s\" (id: %s).", task.TaskNumber, task.Subject, taskID))
 }
 
 func (t *TeamTasksTool) executeUpdate(ctx context.Context, args map[string]any) *Result {
@@ -511,7 +562,7 @@ func (t *TeamTasksTool) executeUpdate(ctx context.Context, args map[string]any) 
 		return ErrorResult("failed to update task: " + err.Error())
 	}
 
-	t.manager.broadcastTeamEvent(protocol.EventTeamTaskUpdated, protocol.TeamTaskEventPayload{
+	t.manager.broadcastTeamEvent(ctx, protocol.EventTeamTaskUpdated, protocol.TeamTaskEventPayload{
 		TeamID:    team.ID.String(),
 		TaskID:    taskID.String(),
 		Subject:   task.Subject,
@@ -524,5 +575,5 @@ func (t *TeamTasksTool) executeUpdate(ctx context.Context, args map[string]any) 
 		ActorID:   t.manager.agentKeyFromID(ctx, agentID),
 	})
 
-	return NewResult(fmt.Sprintf("Task %s updated.", taskID))
+	return NewResult(fmt.Sprintf("Task #%d \"%s\" updated (id: %s).", task.TaskNumber, task.Subject, taskID))
 }
