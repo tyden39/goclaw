@@ -63,7 +63,7 @@ export function AgentDetailPage({ agentId, onBack }: AgentDetailPageProps) {
       />
 
       <div className="p-3 sm:p-4">
-        <div className="max-w-7xl">
+        <div className="max-w-full">
           <Tabs value={activeTab} onValueChange={setActiveTab}>
             <TabsList className="w-full justify-start overflow-x-auto overflow-y-hidden">
               <TabsTrigger value="agent">{t("detail.tabs.agent")}</TabsTrigger>
